@@ -1,11 +1,15 @@
 """核心算法与 FastAPI 接口测试。"""
+import itertools
+import math
 import random
+import weakref
 from fractions import Fraction
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app import cutavoid
 from app.bilingual import (
     MERGE_PENALTY_MS,
     SKIP_PENALTY_MS,
@@ -2827,6 +2831,124 @@ def test_avoid_cuts_min_gap_infeasible_reports_first_blocked_order():
     with pytest.raises(CutAvoidError) as exc_info:
         avoid_cuts(cues, [], 0, 1000)
     assert exc_info.value.blocked_order == 2
+
+
+def test_avoid_cuts_matches_brute_force_on_small_random_inputs():
+    # 暴力枚举全部可行起点序列（总挪动量最小、同分起点序列字典序最小），
+    # 与检查点 + 块内重算的 DP 求解逐一对比（含无解判定）
+    rng = random.Random(20260926)
+    for _ in range(150):
+        n = rng.randint(1, 5)
+        cues = []
+        for i in range(n):
+            start = rng.randint(0, 30)
+            cues.append(
+                Cue(index=str(i + 1), start=start, end=start + rng.randint(1, 8), text="x")
+            )
+        cuts = [rng.randint(0, 45) for _ in range(rng.randint(0, 3))]
+        max_move = rng.randint(0, 2)
+        min_gap = rng.randint(0, 3)
+
+        cut_set = set(cuts)
+        windows = [
+            range(max(0, cue.start - max_move), cue.start + max_move + 1) for cue in cues
+        ]
+        best = None
+        for combo in itertools.product(*windows):
+            prev_end = None
+            total = 0
+            feasible = True
+            for cue, s in zip(cues, combo):
+                duration = cue.end - cue.start
+                if prev_end is not None and prev_end + min_gap > s:
+                    feasible = False
+                    break
+                if any(s < cut < s + duration for cut in cut_set):
+                    feasible = False
+                    break
+                total += abs(s - cue.start)
+                prev_end = s + duration
+            if feasible and (best is None or (total, combo) < best):
+                best = (total, tuple(combo))
+
+        if best is None:
+            with pytest.raises(CutAvoidError):
+                avoid_cuts(cues, cuts, max_move, min_gap)
+        else:
+            plan = avoid_cuts(cues, cuts, max_move, min_gap)
+            assert plan.total_shift_ms == best[0]
+            assert plan.starts == best[1]
+
+
+def test_avoid_cuts_row_builds_stay_linear(monkeypatch):
+    # 检查点 + 块内重算：每行至多构建两次（后向一遍 + 回溯重算一遍），
+    # 候选状态计算总量保持 O(n·W)
+    builds = 0
+    orig_row, orig_last = cutavoid._build_row, cutavoid._build_last_row
+
+    def counting_row(*args):
+        nonlocal builds
+        builds += 1
+        return orig_row(*args)
+
+    def counting_last(*args):
+        nonlocal builds
+        builds += 1
+        return orig_last(*args)
+
+    monkeypatch.setattr(cutavoid, "_build_row", counting_row)
+    monkeypatch.setattr(cutavoid, "_build_last_row", counting_last)
+
+    n = 300
+    cues = [
+        Cue(index=str(i + 1), start=i * 3000, end=i * 3000 + 2000, text="x")
+        for i in range(n)
+    ]
+    plan = avoid_cuts(cues, [i * 3000 + 500 for i in range(n)], 2000, 0)
+    assert builds <= 2 * n
+    assert len(plan.starts) == n
+
+
+def test_avoid_cuts_stores_only_checkpoint_rows(monkeypatch):
+    # 不保存完整代价表：同时存活的 DP 行峰值不超过
+    # 检查点行数 ⌈n/⌊√n⌋⌉ 加一个块内的 ⌊√n⌋ 行（及少量构建中的临时行），
+    # 即辅助空间 O(W·√n) 而非旧实现的 O(W·n)
+    alive = 0
+    peak = 0
+    orig_row, orig_last = cutavoid._build_row, cutavoid._build_last_row
+
+    def track(row):
+        nonlocal alive, peak
+        alive += 1
+        peak = max(peak, alive)
+
+        def drop():
+            nonlocal alive
+            alive -= 1
+
+        weakref.finalize(row, drop)
+        return row
+
+    def tracking_row(*args):
+        return track(orig_row(*args))
+
+    def tracking_last(*args):
+        return track(orig_last(*args))
+
+    monkeypatch.setattr(cutavoid, "_build_row", tracking_row)
+    monkeypatch.setattr(cutavoid, "_build_last_row", tracking_last)
+
+    n = 400
+    cues = [
+        Cue(index=str(i + 1), start=i * 3000, end=i * 3000 + 2000, text="x")
+        for i in range(n)
+    ]
+    plan = avoid_cuts(cues, [i * 3000 + 500 for i in range(n)], 2000, 0)
+    block = max(1, math.isqrt(n))
+    checkpoints = (n + block - 1) // block
+    assert peak <= checkpoints + block + 2
+    assert peak < n // 4  # 保存全表的旧实现峰值即为 n 行
+    assert len(plan.starts) == n
 
 
 def test_cut_avoid_page_served():

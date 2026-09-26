@@ -20,12 +20,20 @@ SRT 后按以下规则重新安排每条字幕的开始时间：
 在全部可行安排中**最小化各条开始挪动绝对值之和**
 ``Σ|new_start − 原开始|``；总挪动量相同时取**新起点序列字典序最小**
 （第一个不同的起点尽量小，再依次比较后续）。实现为按字幕顺序的动态规划：
-每条字幕的候选起点窗口至多 ``2·M+1`` 个整毫秒（M ≤ 2000），用切点禁区间
-在窗口上做掩码，后向 DP 行的后缀最小值承接相邻间隔约束，自后而前求
-``bwd[i][s]``（第 i 条起点取 s 时，i 及之后各条的最小总挪动量）；总最优
-为 ``min bwd[0]``，再自前而后在每个窗口里取满足前缀约束且
+每条字幕的候选起点窗口至多 ``W = 2·M+1`` 个整毫秒（M ≤ 2000），用切点
+禁区间在窗口上做掩码，后向 DP 行的后缀最小值承接相邻间隔约束，自后而前
+求 ``bwd[i][s]``（第 i 条起点取 s 时，i 及之后各条的最小总挪动量）；
+总最优为 ``min bwd[0]``，再自前而后在每个窗口里取满足前缀约束且
 ``bwd[i][s]`` 恰等于剩余预算的最小 s，即得字典序最小的最优序列。
 逐行 DP 用 NumPy 向量化构建（掩码差分 + 后缀最小值）。
+
+**不保存完整代价表**：设字幕条数为 n，按 ``B = ⌊√n⌋`` 把字幕分块。
+后向 DP 只在每个块起点保存一行**检查点**（共 ⌈n/B⌉ 行，O(W√n) 空间），
+其余行用后即弃；随后自前而后逐块回溯——每块从块末的检查点（末块从末条
+的末行）自后而前重算块内 ≤ B 行（O(W√n) 空间），再在块内按「剩余预算
+恰好匹配的最小可行起点」逐个确定新起点。每行至多构建两次，候选状态计算
+总量保持 O(nW)，辅助空间为 O(W√n + n + k)（k 为去重切点数）；重算与
+全表保存是同一组整数递推，结果与保存完整代价表完全相同。
 
 **无解**时调用 :func:`first_blocked_order` 可得到「最先无法继续安排」的
 字幕输入序号（从 1 开始）：按最早可行起点贪心安排前序字幕后，第 k 条在
@@ -36,6 +44,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass
+from math import isqrt
 
 import numpy as np
 
@@ -185,7 +194,11 @@ def avoid_cuts(
     max_move_ms: int,
     min_gap_ms: int,
 ) -> AvoidPlan:
-    """求切点避让最优安排；前 k 条整体无解时抛出 :class:`CutAvoidError`。"""
+    """求切点避让最优安排；前 k 条整体无解时抛出 :class:`CutAvoidError`。
+
+    后向 DP 只在每个块起点保存检查点行，回溯时逐块重算块内各行，
+    不保存完整代价表（空间 O(W√n + n + k)，见模块文档字符串）。
+    """
     cuts = normalize_cuts(raw_cuts)
 
     blocked = first_blocked_order(cues, cuts, max_move_ms, min_gap_ms)
@@ -199,50 +212,70 @@ def avoid_cuts(
     n = len(cues)
     lows = [max(0, cue.start - max_move_ms) for cue in cues]
     highs = [cue.start + max_move_ms for cue in cues]
+    durations = [cue.end - cue.start for cue in cues]
 
-    # 自后而前构建后向 DP：rows[i][s − lows[i]] = 第 i 条起点取 s 时的最优尾代价
-    last = cues[-1]
-    rows: list[np.ndarray] = [np.empty(0, dtype=np.int64)] * n
-    rows[n - 1] = _build_last_row(
-        lows[n - 1], highs[n - 1], last.start, last.end - last.start, cuts
-    )
-    for i in range(n - 2, -1, -1):
-        cue = cues[i]
-        rows[i] = _build_row(
+    # 块大小取 ⌊√n⌋：检查点行数 ⌈n/B⌉ 与块内行数 B 均为 O(√n)
+    block = max(1, isqrt(n))
+
+    def build_row(i: int, next_row: np.ndarray | None) -> np.ndarray:
+        """构建第 i 条的后向 DP 行；i 为末条时忽略 next_row 直接构建末行。"""
+        if i == n - 1:
+            return _build_last_row(lows[i], highs[i], cues[i].start, durations[i], cuts)
+        assert next_row is not None
+        return _build_row(
             lows[i],
             highs[i],
-            cue.start,
-            cue.end - cue.start,
+            cues[i].start,
+            durations[i],
             cuts,
-            rows[i + 1],
+            next_row,
             lows[i + 1],
             min_gap_ms,
         )
 
-    # 总最优 = 首条尾代价最小值；自前而后取剩余预算恰好匹配的最小起点，
+    # 自后而前构建后向 DP：rows[i][s − lows[i]] = 第 i 条起点取 s 时的最优
+    # 尾代价；只在块起点保存检查点行，非检查点行构建后立即丢弃
+    checkpoints: dict[int, np.ndarray] = {}
+    next_row: np.ndarray | None = None
+    for i in range(n - 1, -1, -1):
+        row = build_row(i, next_row)
+        if i % block == 0:
+            checkpoints[i] = row
+        next_row = row
+
+    # 总最优 = 首条尾代价最小值（首行即块 0 起点的检查点）
+    total = int(checkpoints[0].min())
+
+    # 自前而后逐块回溯：每块从块末检查点（末块从末条末行）重算块内各行，
+    # 再在块内取满足前缀约束且尾代价恰等于剩余预算的最小起点，
     # 得到总挪动量最小、同分新起点序列字典序最小的安排
-    total = int(rows[0].min())
     starts: list[int] = []
     spent = 0
     prev_end: int | None = None
-    for i, cue in enumerate(cues):
-        lo, hi = lows[i], highs[i]
-        row = rows[i]
-        if prev_end is not None:
-            gap_idx = prev_end + min_gap_ms - lo
-            if gap_idx > 0:
-                row = row[gap_idx:]
-                offset = gap_idx
-            else:
-                offset = 0
-        else:
+    for block_start in range(0, n, block):
+        block_end = min(block_start + block, n)
+        # 块内重算：末块的首个 next_row 为 None（末行走 _build_last_row），
+        # 其余块取其下一块起点处的检查点行
+        next_row = checkpoints.get(block_end)
+        rows: list[np.ndarray] = [np.empty(0, dtype=np.int64)] * (block_end - block_start)
+        for i in range(block_end - 1, block_start - 1, -1):
+            row = build_row(i, next_row)
+            rows[i - block_start] = row
+            next_row = row
+
+        for i in range(block_start, block_end):
             offset = 0
-        matches = np.flatnonzero(row == total - spent)
-        if matches.size == 0:  # 已通过贪心可行性检查，理论上不可达
-            raise CutAvoidError(f"第 {i + 1} 条字幕回溯最优安排失败。")
-        chosen = lo + offset + int(matches[0])
-        starts.append(chosen)
-        spent += abs(chosen - cue.start)
-        prev_end = chosen + (cue.end - cue.start)
+            if prev_end is not None:
+                gap_idx = prev_end + min_gap_ms - lows[i]
+                if gap_idx > 0:
+                    offset = gap_idx
+            row = rows[i - block_start]
+            matches = np.flatnonzero(row[offset:] == total - spent)
+            if matches.size == 0:  # 已通过贪心可行性检查，理论上不可达
+                raise CutAvoidError(f"第 {i + 1} 条字幕回溯最优安排失败。")
+            chosen = lows[i] + offset + int(matches[0])
+            starts.append(chosen)
+            spent += abs(chosen - cues[i].start)
+            prev_end = chosen + durations[i]
 
     return AvoidPlan(starts=tuple(starts), cuts=cuts, total_shift_ms=total)
