@@ -2829,6 +2829,143 @@ def test_avoid_cuts_min_gap_infeasible_reports_first_blocked_order():
     assert exc_info.value.blocked_order == 2
 
 
+def _brute_force_avoid(cues, cuts, max_move_ms, min_gap_ms):
+    """暴力枚举全部候选起点组合，返回 (最小总挪动量, 字典序最小起点序列) 或 None。"""
+    import itertools
+
+    durations = [c.end - c.start for c in cues]
+    windows = [
+        range(max(0, c.start - max_move_ms), c.start + max_move_ms + 1) for c in cues
+    ]
+    best = None
+    for combo in itertools.product(*windows):
+        feasible = True
+        for i, s in enumerate(combo):
+            if any(s < c < s + durations[i] for c in cuts):
+                feasible = False
+                break
+            if i and combo[i - 1] + durations[i - 1] + min_gap_ms > s:
+                feasible = False
+                break
+        if not feasible:
+            continue
+        total = sum(abs(s - cues[i].start) for i, s in enumerate(combo))
+        if best is None or total < best[0] or (total == best[0] and combo < best[1]):
+            best = (total, combo)
+    return best
+
+
+def test_avoid_cuts_matches_brute_force_on_random_small():
+    # 检查点 + 块内重算不得改变结果：与暴力枚举的最优值、字典序最小序列、
+    # 无解判定逐一一致（覆盖单块与跨块两种情形）
+    rng = random.Random(20260926)
+    for _ in range(250):
+        n = rng.randint(1, 4)
+        cues = [
+            Cue(
+                index=str(i + 1),
+                start=(start := rng.randint(0, 25)),
+                end=start + rng.randint(1, 10),
+                text="x",
+            )
+            for i in range(n)
+        ]
+        raw_cuts = [rng.randint(0, 35) for _ in range(rng.randint(0, 4))]
+        max_move, min_gap = rng.randint(0, 4), rng.randint(0, 3)
+        best = _brute_force_avoid(cues, normalize_cuts(raw_cuts), max_move, min_gap)
+        if best is None:
+            with pytest.raises(CutAvoidError) as exc_info:
+                avoid_cuts(cues, raw_cuts, max_move, min_gap)
+            assert exc_info.value.blocked_order == first_blocked_order(
+                cues, normalize_cuts(raw_cuts), max_move, min_gap
+            )
+        else:
+            plan = avoid_cuts(cues, raw_cuts, max_move, min_gap)
+            assert plan.total_shift_ms == best[0]
+            assert plan.starts == best[1]
+
+
+def test_avoid_cuts_checkpoints_bound_space_and_recompute(monkeypatch):
+    # 空间优化的两条不变式：检查点行数为 ⌈n/⌊√n⌋⌋（约 √n 行而非全部 n 行），
+    # 且每条 DP 行至多计算两遍（后向一遍 + 前向块内重算一遍），
+    # 候选状态计算总量保持 O(n·W)
+    import math
+
+    import app.cutavoid as cutavoid_module
+
+    cues = parse_srt("".join(
+        f"{i}\n{format_timecode((i - 1) * 3000)} --> {format_timecode((i - 1) * 3000 + 1500)}\n第{i}句\n\n"
+        for i in range(1, 41)
+    ))
+    n = len(cues)
+    cuts = [6000, 19000, 45000, 70000, 103000]
+
+    calls = {"row": 0, "last": 0}
+    real_row, real_last = cutavoid_module._build_row, cutavoid_module._build_last_row
+
+    def counting_row(*args):
+        calls["row"] += 1
+        return real_row(*args)
+
+    def counting_last(*args):
+        calls["last"] += 1
+        return real_last(*args)
+
+    monkeypatch.setattr(cutavoid_module, "_build_row", counting_row)
+    monkeypatch.setattr(cutavoid_module, "_build_last_row", counting_last)
+    plan = avoid_cuts(cues, cuts, 2000, 100)
+    assert calls["row"] + calls["last"] <= 2 * n
+
+    block = max(1, math.isqrt(n))
+    checkpoints = cutavoid_module._build_checkpoints(
+        [max(0, c.start - 2000) for c in cues],
+        [c.start + 2000 for c in cues],
+        [c.start for c in cues],
+        [c.end - c.start for c in cues],
+        normalize_cuts(cuts),
+        100,
+        block,
+    )
+    assert len(checkpoints) == (n + block - 1) // block
+    # 40 条跨多块：结果自身满足全部约束，且总挪动量等于逐条偏移绝对值之和
+    assert len(plan.starts) == n
+    durations = [c.end - c.start for c in cues]
+    norm_cuts = normalize_cuts(cuts)
+    for i, s in enumerate(plan.starts):
+        assert max(0, cues[i].start - 2000) <= s <= cues[i].start + 2000
+        assert not any(s < c < s + durations[i] for c in norm_cuts)
+        if i:
+            assert plan.starts[i - 1] + durations[i - 1] + 100 <= s
+    assert plan.total_shift_ms == sum(
+        abs(s - cue.start) for s, cue in zip(plan.starts, cues)
+    )
+
+
+def test_avoid_cuts_large_input_bounded_memory():
+    # 6000 条 × 窗口 4001：完整代价表约需 192 MB，检查点方案只需约 √n 行
+    # （个位数 MB）；峰值内存增量必须远小于完整表，且结果仍精确
+    resource = pytest.importorskip("resource")
+
+    n, max_move = 6000, 2000
+    cues = [
+        Cue(index=str(i + 1), start=i * 3000, end=i * 3000 + 1500, text="x")
+        for i in range(n)
+    ]
+    # 每 3 条一个字幕内部切点：该条须移到切点边界 +700（比 −800 便宜）
+    cuts = [i * 3000 + 700 for i in range(0, n, 3)]
+
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    plan = avoid_cuts(cues, cuts, max_move, 0)
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert after - before < 64 * 1024  # 完整代价表约 192 MB，阈值留有数倍余量
+
+    expected = tuple(
+        i * 3000 + 700 if i % 3 == 0 else i * 3000 for i in range(n)
+    )
+    assert plan.starts == expected
+    assert plan.total_shift_ms == 700 * (n // 3)
+
+
 def test_cut_avoid_page_served():
     resp = client.get("/cut-avoid")
     assert resp.status_code == 200
